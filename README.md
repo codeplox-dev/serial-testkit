@@ -31,7 +31,7 @@ Run on both machines connected via serial cable:
 
 **Machine A:**
 ```bash
-SERIAL_DEVICE=/dev/ttyUSB0 ./pop run
+SERIAL_DEVICE=/dev/ttyAMA4 ./pop run
 ```
 
 **Machine B:**
