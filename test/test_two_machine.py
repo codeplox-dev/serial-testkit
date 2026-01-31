@@ -86,6 +86,13 @@ class TestTwoMachine(unittest.TestCase):
             self.assertGreater(recv, 0, f"Instance {i + 1}: No messages received")
             self.assertEqual(ok, recv, f"Instance {i + 1}: CRC failures ({ok}/{recv})")
 
+            # Verify latency output is present
+            latency_match = re.search(r"latency: avg=[\d.]+ms", output)
+            self.assertIsNotNone(
+                latency_match,
+                f"Instance {i + 1}: No latency stats found in output:\n{output}",
+            )
+
     @staticmethod
     def _terminate_process(proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
         if proc.poll() is None:
