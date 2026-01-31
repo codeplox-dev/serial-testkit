@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from types import FrameType
 from typing import Protocol
 
@@ -23,6 +24,45 @@ logger = logging.getLogger(__name__)
 DEFAULT_BAUDRATE = 115200
 DEFAULT_DURATION_S = 15
 DEFAULT_WARMUP_S = 5
+
+
+@dataclass
+class LatencyStats:
+    """Computed latency statistics in milliseconds."""
+
+    count: int
+    min_ms: float
+    max_ms: float
+    avg_ms: float
+    p50_ms: float
+    p95_ms: float
+    p99_ms: float
+
+
+def compute_latency_stats(rtt_samples: list[float]) -> LatencyStats | None:
+    """Compute latency statistics from RTT samples (in seconds).
+
+    Returns None if no samples available.
+    """
+    if not rtt_samples:
+        return None
+
+    count = len(rtt_samples)
+    samples_ms = sorted(s * 1000 for s in rtt_samples)
+
+    def percentile(sorted_data: list[float], p: float) -> float:
+        idx = int(p / 100 * (len(sorted_data) - 1))
+        return sorted_data[idx]
+
+    return LatencyStats(
+        count=count,
+        min_ms=samples_ms[0],
+        max_ms=samples_ms[-1],
+        avg_ms=sum(samples_ms) / count,
+        p50_ms=percentile(samples_ms, 50),
+        p95_ms=percentile(samples_ms, 95),
+        p99_ms=percentile(samples_ms, 99),
+    )
 
 
 class SerialDevice(Protocol):
@@ -153,15 +193,26 @@ class HardwareDevice:
 
 def run_loop(
     dev: SerialDevice, duration_s: int, warmup_s: int = DEFAULT_WARMUP_S
-) -> tuple[int, int, int]:
-    """Run send/receive loop until duration expires or SIGINT. Returns (sent, received, crc_ok).
+) -> tuple[int, int, int, int, float, list[float]]:
+    """Run send/receive loop until duration expires or SIGINT.
+
+    Returns (sent, received, crc_ok, bytes_transferred, elapsed_s, rtt_samples).
+
+    rtt_samples contains the round-trip time in seconds for each successful
+    message exchange. Timeouts are not included.
 
     During warmup_s, write timeouts are tolerated (retried) while waiting for peer.
     After warmup, write timeouts raise SerialTimeoutException.
+
+    Stats counting begins only after peer detection (first successful read), so messages
+    sent during warmup before the peer is ready are not counted.
     """
     sent, received, crc_ok = 0, 0, 0
+    bytes_transferred = 0
+    rtt_samples: list[float] = []
     running = True
     start_time = time.monotonic()
+    stats_start_time: float | None = None
     peer_detected = False
     warmup_logged = False
 
@@ -176,7 +227,9 @@ def run_loop(
         in_warmup = elapsed < warmup_s
 
         try:
-            dev.write_msg(message.random_payload())
+            payload_out = message.random_payload()
+            msg_start = time.monotonic()
+            dev.write_msg(payload_out)
         except serial.SerialTimeoutException:
             if in_warmup:
                 if not warmup_logged:
@@ -185,26 +238,58 @@ def run_loop(
                 continue
             raise
 
-        sent += 1
-
-        if not peer_detected:
-            logger.info("Peer detected")
-            peer_detected = True
+        # Only count sent after peer is detected (first successful read)
+        if peer_detected:
+            sent += 1
+            # Count bytes: payload + 8 bytes protocol overhead (4-byte length + 4-byte CRC)
+            bytes_transferred += len(payload_out) + 8
 
         payload, ok = dev.read_msg()
         if payload is not None:
-            received += 1
-            if ok:
-                crc_ok += 1
+            if not peer_detected:
+                logger.info("Peer detected")
+                peer_detected = True
+                stats_start_time = time.monotonic()
+            else:
+                # Only count received after peer was already detected
+                rtt_samples.append(time.monotonic() - msg_start)
+                received += 1
+                bytes_transferred += len(payload) + 8
+                if ok:
+                    crc_ok += 1
 
-    return sent, received, crc_ok
+    elapsed_s = (time.monotonic() - stats_start_time) if stats_start_time else 0.0
+    return sent, received, crc_ok, bytes_transferred, elapsed_s, rtt_samples
 
 
-def report(stats: tuple[int, int, int]) -> None:
+THROUGHPUT_MIN_DURATION_S = 30
+
+
+def report(stats: tuple[int, int, int, int, float, list[float]]) -> None:
     """Print statistics from run_loop."""
-    sent, received, crc_ok = stats
+    sent, received, crc_ok, bytes_transferred, elapsed_s, rtt_samples = stats
     pct = (crc_ok / received * 100) if received else 0
     print(f"sent={sent} recv={received} ok={crc_ok} ({pct:.1f}%)")
+    if sent != received:
+        print("(Note: sent/recv counts differ due to in-flight message when one side stopped first)")
+    if elapsed_s > 0 and bytes_transferred > 0:
+        # For 8N1 UART: each byte needs 10 bits on wire (1 start + 8 data + 1 stop)
+        bytes_per_sec = bytes_transferred / elapsed_s
+        baud = bytes_per_sec * 10
+        kbps = (bytes_transferred * 8 / elapsed_s) / 1000
+        print(f"throughput: {baud:,.0f} baud ({kbps:.2f} Kbps) over {elapsed_s:.1f}s")
+        if elapsed_s < THROUGHPUT_MIN_DURATION_S:
+            print("(Note: throughput from short test may not reflect sustained performance)")
+    latency = compute_latency_stats(rtt_samples)
+    if latency:
+        print(
+            f"latency: avg={latency.avg_ms:.2f}ms min={latency.min_ms:.2f}ms "
+            f"max={latency.max_ms:.2f}ms"
+        )
+        print(
+            f"         p50={latency.p50_ms:.2f}ms p95={latency.p95_ms:.2f}ms "
+            f"p99={latency.p99_ms:.2f}ms (n={latency.count})"
+        )
 
 
 def run_test(dev: SerialDevice, duration: int, warmup: int) -> int:

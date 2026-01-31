@@ -25,7 +25,12 @@ Run serial read / write software for a short time with a virtual pty:
 Output shows statistics when complete:
 ```
 sent=110776 recv=110776 ok=110776 (100.0%)
+throughput: 111,000,134 baud (88800.11 Kbps) over 15.0s
+latency: avg=0.02ms min=0.02ms max=4.07ms
+         p50=0.02ms p95=0.03ms p99=0.04ms (n=110776)
 ```
+
+Throughput shows baud (line rate for 8N1 UART: 10 bits per byte including start/stop bits) and Kbps (actual data rate).
 
 ### Two-machine serial test
 

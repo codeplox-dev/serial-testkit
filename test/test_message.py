@@ -1,9 +1,10 @@
-"""Unit tests for message encoding/decoding."""
+"""Unit tests for message encoding/decoding and latency statistics."""
 
 import io
 import unittest
 
 import message
+import serialtest
 
 
 class TestUint32Conversion(unittest.TestCase):
@@ -106,6 +107,48 @@ class TestRandomPayload(unittest.TestCase):
         payloads = [message.random_payload() for _ in range(10)]
         unique = set(payloads)
         self.assertGreater(len(unique), 1)
+
+
+class TestLatencyStats(unittest.TestCase):
+    """Test latency statistics computation."""
+
+    def test_empty_samples(self) -> None:
+        result = serialtest.compute_latency_stats([])
+        self.assertIsNone(result)
+
+    def test_single_sample(self) -> None:
+        result = serialtest.compute_latency_stats([0.010])  # 10ms in seconds
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertAlmostEqual(result.avg_ms, 10.0)
+        self.assertAlmostEqual(result.min_ms, 10.0)
+        self.assertAlmostEqual(result.max_ms, 10.0)
+        self.assertEqual(result.count, 1)
+
+    def test_multiple_samples(self) -> None:
+        # 1ms, 2ms, 3ms, 4ms, 5ms in seconds
+        samples = [0.001, 0.002, 0.003, 0.004, 0.005]
+        result = serialtest.compute_latency_stats(samples)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.count, 5)
+        self.assertAlmostEqual(result.min_ms, 1.0)
+        self.assertAlmostEqual(result.max_ms, 5.0)
+        self.assertAlmostEqual(result.avg_ms, 3.0)
+        self.assertAlmostEqual(result.p50_ms, 3.0)
+
+    def test_percentiles_with_outlier(self) -> None:
+        # 95 samples at 1ms, 5 samples at 100ms
+        # With nearest-rank: p95 index = int(95/100 * 99) = 94, p99 index = 98
+        samples = [0.001] * 95 + [0.100] * 5
+        result = serialtest.compute_latency_stats(samples)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertAlmostEqual(result.p50_ms, 1.0)
+        # p95 at index 94 is still 1ms (last of the 95 1ms samples)
+        self.assertAlmostEqual(result.p95_ms, 1.0)
+        # p99 at index 98 is 100ms (4th of the 5 100ms samples)
+        self.assertAlmostEqual(result.p99_ms, 100.0)
 
 
 if __name__ == "__main__":
