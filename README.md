@@ -34,7 +34,7 @@ Throughput shows baud (line rate for 8N1 UART: 10 bits per byte including start/
 
 ### Two-machine serial test
 
-Run on both machines connected via serial cable with hardware flow control (`ctsrts`):
+Run on both machines connected via serial cable with hardware flow control (`rtscts`):
 
 **Machine A (like a Linux workstation):**
 ```bash
@@ -55,8 +55,9 @@ Both sides simultaneously send and receive messages.
 | `-d`, `--device` | (required) | Serial device path |
 | `-b`, `--baudrate` | 115200 | Serial baud rate |
 | `-t`, `--duration` | 15 | Test duration in seconds (0 = until Ctrl-C) |
-| `-f`, `--flow-control` | ctsrts | Flow control: `none`, `ctsrts`, `software` |
-| `-w`, `--warmup` | 5 | Warmup period in seconds to wait for peer |
+| `-f`, `--flow-control` | rtscts | Flow control: `none`, `rtscts`, `software` |
+| `-w`, `--warmup` | 20 | Warmup period in seconds to wait for peer |
+| `--flush/--no-flush` | flush | Flush serial buffers on start |
 
 During the warmup period, write timeouts are tolerated while waiting for the peer to start. This handles the case where the two machines don't start at exactly the same time. After warmup, write timeouts are treated as errors.
 
@@ -65,7 +66,7 @@ Example with options:
 ./pop run -d /dev/ttyAMA4 -b 9600 -t 60
 ```
 
-Loopback mode also accepts `-b`, `-t`, and `-w` options.
+Loopback mode also accepts `-b`, `-t`, `-w`, and `--flush/--no-flush` options.
 
 ### Operations
 
