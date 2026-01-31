@@ -33,12 +33,12 @@ Run on both machines connected via serial cable with hardware flow control (`cts
 
 **Machine A (like a Linux workstation):**
 ```bash
-./pop run -d /dev/ttyUSB0
+sudo ./pop run -d /dev/ttyUSB0
 ```
 
 **Machine B (like a Raspberry Pi):**
 ```bash
-./pop run -d /dev/ttyAMA4
+sudo ./pop run -d /dev/ttyAMA4
 ```
 
 Both sides simultaneously send and receive messages.
