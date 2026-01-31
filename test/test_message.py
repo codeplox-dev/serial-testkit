@@ -1,0 +1,112 @@
+"""Unit tests for message encoding/decoding."""
+
+import io
+import unittest
+
+import message
+
+
+class TestUint32Conversion(unittest.TestCase):
+    """Test uint32 byte conversion functions."""
+
+    def test_roundtrip_zero(self) -> None:
+        self.assertEqual(message.uint32_from_bytes(message.uint32_to_bytes(0)), 0)
+
+    def test_roundtrip_max(self) -> None:
+        max_val = 2**32 - 1
+        self.assertEqual(
+            message.uint32_from_bytes(message.uint32_to_bytes(max_val)), max_val
+        )
+
+    def test_little_endian(self) -> None:
+        # 0x01020304 in little-endian is [04, 03, 02, 01]
+        self.assertEqual(message.uint32_to_bytes(0x01020304), b"\x04\x03\x02\x01")
+
+    def test_from_bytes_little_endian(self) -> None:
+        self.assertEqual(message.uint32_from_bytes(b"\x04\x03\x02\x01"), 0x01020304)
+
+
+class TestEncodeDecode(unittest.TestCase):
+    """Test message encode/decode roundtrip."""
+
+    def test_roundtrip_empty(self) -> None:
+        payload = b""
+        encoded = message.encode(payload)
+        reader = io.BytesIO(encoded)
+        decoded, ok = message.decode(reader)
+        self.assertTrue(ok)
+        self.assertEqual(decoded, payload)
+
+    def test_roundtrip_simple(self) -> None:
+        payload = b"hello"
+        encoded = message.encode(payload)
+        reader = io.BytesIO(encoded)
+        decoded, ok = message.decode(reader)
+        self.assertTrue(ok)
+        self.assertEqual(decoded, payload)
+
+    def test_roundtrip_binary(self) -> None:
+        payload = bytes(range(256))
+        encoded = message.encode(payload)
+        reader = io.BytesIO(encoded)
+        decoded, ok = message.decode(reader)
+        self.assertTrue(ok)
+        self.assertEqual(decoded, payload)
+
+    def test_encoded_format(self) -> None:
+        payload = b"test"
+        encoded = message.encode(payload)
+        # Should be: 4-byte length + payload + 4-byte CRC
+        self.assertEqual(len(encoded), 4 + len(payload) + 4)
+        # First 4 bytes should be length (4 in little-endian)
+        self.assertEqual(encoded[:4], b"\x04\x00\x00\x00")
+        # Next bytes should be payload
+        self.assertEqual(encoded[4:8], b"test")
+
+    def test_decode_truncated_length(self) -> None:
+        reader = io.BytesIO(b"\x04\x00")  # Only 2 bytes, need 4
+        decoded, ok = message.decode(reader)
+        self.assertIsNone(decoded)
+        self.assertFalse(ok)
+
+    def test_decode_truncated_payload(self) -> None:
+        # Length says 10 bytes, but only 5 provided
+        reader = io.BytesIO(b"\x0a\x00\x00\x00hello")
+        decoded, ok = message.decode(reader)
+        self.assertIsNone(decoded)
+        self.assertFalse(ok)
+
+    def test_decode_corrupted_crc(self) -> None:
+        payload = b"hello"
+        encoded = bytearray(message.encode(payload))
+        # Corrupt the last byte (part of CRC)
+        encoded[-1] ^= 0xFF
+        reader = io.BytesIO(bytes(encoded))
+        decoded, ok = message.decode(reader)
+        # Should return payload but with ok=False
+        self.assertEqual(decoded, payload)
+        self.assertFalse(ok)
+
+
+class TestRandomPayload(unittest.TestCase):
+    """Test random payload generation."""
+
+    def test_within_size_bounds(self) -> None:
+        for _ in range(100):
+            payload = message.random_payload()
+            self.assertGreaterEqual(len(payload), message.MIN_PAYLOAD_SIZE)
+            self.assertLessEqual(len(payload), message.MAX_PAYLOAD_SIZE)
+
+    def test_returns_bytes(self) -> None:
+        payload = message.random_payload()
+        self.assertIsInstance(payload, bytes)
+
+    def test_varies(self) -> None:
+        # Generate several payloads, they should not all be identical
+        payloads = [message.random_payload() for _ in range(10)]
+        unique = set(payloads)
+        self.assertGreater(len(unique), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
