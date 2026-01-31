@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BAUDRATE = 115200
 DEFAULT_DURATION_S = 15
+DEFAULT_WARMUP_S = 5
 
 
 class SerialDevice(Protocol):
@@ -150,11 +151,19 @@ class HardwareDevice:
         return _read_msg(self._serial)
 
 
-def run_loop(dev: SerialDevice, duration_s: int) -> tuple[int, int, int]:
-    """Run send/receive loop until duration expires or SIGINT. Returns (sent, received, crc_ok)."""
+def run_loop(
+    dev: SerialDevice, duration_s: int, warmup_s: int = DEFAULT_WARMUP_S
+) -> tuple[int, int, int]:
+    """Run send/receive loop until duration expires or SIGINT. Returns (sent, received, crc_ok).
+
+    During warmup_s, write timeouts are tolerated (retried) while waiting for peer.
+    After warmup, write timeouts raise SerialTimeoutException.
+    """
     sent, received, crc_ok = 0, 0, 0
     running = True
     start_time = time.monotonic()
+    peer_detected = False
+    warmup_logged = False
 
     def handler(_sig: int, _frame: FrameType | None) -> None:
         nonlocal running
@@ -163,8 +172,25 @@ def run_loop(dev: SerialDevice, duration_s: int) -> tuple[int, int, int]:
     signal.signal(signal.SIGINT, handler)
 
     while running and (duration_s == 0 or (time.monotonic() - start_time) < duration_s):
-        dev.write_msg(message.random_payload())
+        elapsed = time.monotonic() - start_time
+        in_warmup = elapsed < warmup_s
+
+        try:
+            dev.write_msg(message.random_payload())
+        except serial.SerialTimeoutException:
+            if in_warmup:
+                if not warmup_logged:
+                    logger.info("Waiting for peer...")
+                    warmup_logged = True
+                continue
+            raise
+
         sent += 1
+
+        if not peer_detected:
+            logger.info("Peer detected")
+            peer_detected = True
+
         payload, ok = dev.read_msg()
         if payload is not None:
             received += 1
@@ -181,13 +207,13 @@ def report(stats: tuple[int, int, int]) -> None:
     print(f"sent={sent} recv={received} ok={crc_ok} ({pct:.1f}%)")
 
 
-def run_test(dev: SerialDevice, duration: int) -> int:
+def run_test(dev: SerialDevice, duration: int, warmup: int) -> int:
     """Run the test loop and report results."""
     try:
         logger.info("Serial device ready")
         duration_msg = "indefinitely" if duration == 0 else f"for {duration}s"
         logger.info(f"Running test loop {duration_msg} (Ctrl-C to stop)")
-        report(run_loop(dev, duration))
+        report(run_loop(dev, duration, warmup))
         return 0
     except serial.SerialException as e:
         logger.error(f"Serial error: {e}")
@@ -200,7 +226,7 @@ def run_test(dev: SerialDevice, duration: int) -> int:
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
-    """Add baudrate and duration arguments to a parser."""
+    """Add baudrate, duration, and warmup arguments to a parser."""
     parser.add_argument(
         "-b",
         "--baudrate",
@@ -214,6 +240,13 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_DURATION_S,
         help=f"Duration in seconds, 0 = indefinite (default: {DEFAULT_DURATION_S})",
+    )
+    parser.add_argument(
+        "-w",
+        "--warmup",
+        type=int,
+        default=DEFAULT_WARMUP_S,
+        help=f"Warmup period in seconds to wait for peer (default: {DEFAULT_WARMUP_S})",
     )
 
 
@@ -255,11 +288,11 @@ Examples:
 
     if args.mode == "loopback":
         dev: SerialDevice = LoopbackDevice(args.baudrate)
-        return run_test(dev, args.duration)
+        return run_test(dev, args.duration, args.warmup)
 
     if args.device:
         dev = HardwareDevice(args.device, args.flow_control, args.baudrate)
-        return run_test(dev, args.duration)
+        return run_test(dev, args.duration, args.warmup)
 
     parser.print_help()
     return 2
