@@ -1,0 +1,137 @@
+#!/bin/bash
+#
+# pop - Project Operation
+#
+# A simple project operation execution script for environments lacking "make",
+# "just", "pip", "uv", or "poetry" and where installing Python dependencies at
+# the system level is undesirable. This script manages a local virtualenv and
+# provides common project operations.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/.venv"
+PYTHON="${VENV_DIR}/bin/python"
+
+# Exit codes
+EXIT_OK=0
+EXIT_USAGE=2          # Missing argument or invalid operation
+EXIT_MISSING_ENV=3    # Required environment variable not set
+EXIT_SETUP_FAILED=4   # Setup or dependency installation failed
+EXIT_RUN_FAILED=5     # Python script or test execution failed
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") <operation>
+
+Operations:
+  setup       Create virtualenv and install dependencies
+  distclean   Remove virtualenv and all cache directories
+  test        Run the test suite
+  run-loop    Run in loopback mode (single machine test)
+  run         Run two-machine mode (requires SERIAL_DEVICE envvar)
+  help        Show this help message
+
+Environment variables:
+  SERIAL_DEVICE    Serial device path for 'run' operation (e.g., /dev/ttyUSB0)
+  BAUDRATE         Serial baud rate (default: 115200)
+  RUN_DURATION_S   Test duration in seconds, 0 = indefinite (default: 15)
+  MSG_COUNT        Reserved for future use (default: 50)
+EOF
+}
+
+cmd_setup() {
+    echo "Creating virtualenv in $VENV_DIR..."
+    if ! python3 -m venv "$VENV_DIR"; then
+        echo "Error: Failed to create virtualenv." >&2
+        exit $EXIT_SETUP_FAILED
+    fi
+    echo "Installing dependencies..."
+    if ! "$VENV_DIR/bin/pip" install --quiet --upgrade pip; then
+        echo "Error: Failed to upgrade pip." >&2
+        exit $EXIT_SETUP_FAILED
+    fi
+    if ! "$VENV_DIR/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements.txt"; then
+        echo "Error: Failed to install requirements." >&2
+        exit $EXIT_SETUP_FAILED
+    fi
+    echo "Setup complete."
+}
+
+ensure_setup() {
+    if [[ ! -x "$PYTHON" ]]; then
+        echo "Virtualenv not found. Running setup..."
+        cmd_setup
+    fi
+}
+
+cmd_distclean() {
+    echo "Removing virtualenv and cache directories..."
+    rm -rf "$VENV_DIR"
+    rm -rf "$SCRIPT_DIR"/__pycache__
+    rm -rf "$SCRIPT_DIR"/.mypy_cache
+    rm -rf "$SCRIPT_DIR"/.pytest_cache
+    rm -rf "$SCRIPT_DIR"/.ruff_cache
+    echo "Clean complete."
+}
+
+cmd_test() {
+    ensure_setup
+    echo "Running tests..."
+    if ! "$PYTHON" -m unittest discover -s "$SCRIPT_DIR/test" -v; then
+        echo "Error: Tests failed." >&2
+        exit $EXIT_RUN_FAILED
+    fi
+}
+
+cmd_run_loop() {
+    ensure_setup
+    if ! "$PYTHON" "$SCRIPT_DIR/run_serial.py" -d loopback -f none; then
+        echo "Error: Loopback run failed." >&2
+        exit $EXIT_RUN_FAILED
+    fi
+}
+
+cmd_run() {
+    if [[ -z "${SERIAL_DEVICE:-}" ]]; then
+        echo "Error: SERIAL_DEVICE environment variable not set." >&2
+        echo "Example: SERIAL_DEVICE=/dev/ttyUSB0 ./pop run" >&2
+        exit $EXIT_MISSING_ENV
+    fi
+    ensure_setup
+    if ! "$PYTHON" "$SCRIPT_DIR/run_serial.py" -d "$SERIAL_DEVICE"; then
+        echo "Error: Run failed." >&2
+        exit $EXIT_RUN_FAILED
+    fi
+}
+
+if [[ $# -lt 1 ]]; then
+    usage
+    exit $EXIT_USAGE
+fi
+
+case "$1" in
+    setup)
+        cmd_setup
+        ;;
+    distclean)
+        cmd_distclean
+        ;;
+    test)
+        cmd_test
+        ;;
+    run-loop)
+        cmd_run_loop
+        ;;
+    run)
+        cmd_run
+        ;;
+    help|--help|-h)
+        usage
+        ;;
+    *)
+        echo "Error: Unknown operation '$1'" >&2
+        usage
+        exit $EXIT_USAGE
+        ;;
+esac
