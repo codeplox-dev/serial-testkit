@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BAUDRATE = 115200
 DEFAULT_DURATION_S = 15
-DEFAULT_WARMUP_S = 5
+DEFAULT_WARMUP_S = 20
 
 
 @dataclass
@@ -84,7 +84,7 @@ def _read_msg(ser: serial.Serial) -> tuple[bytes | None, bool]:
 class LoopbackDevice:
     """Virtual loopback device using a pty pair."""
 
-    def __init__(self, baudrate: int) -> None:
+    def __init__(self, baudrate: int, flush: bool = True) -> None:
         if sys.platform not in ("linux", "darwin"):
             raise RuntimeError(
                 f"Loopback mode only supported on Linux/macOS, not {sys.platform}"
@@ -100,6 +100,10 @@ class LoopbackDevice:
             xonxoff=False,
             rtscts=False,
         )
+        if flush:
+            self._serial.reset_input_buffer()
+            self._serial.reset_output_buffer()
+            logger.debug("Flushed serial buffers")
         self._running = True
         self._echo_thread = threading.Thread(target=self._echo_loop, daemon=True)
         self._echo_thread.start()
@@ -131,7 +135,9 @@ class LoopbackDevice:
 class HardwareDevice:
     """Hardware serial device."""
 
-    def __init__(self, device: str, flow_control: str, baudrate: int) -> None:
+    def __init__(
+        self, device: str, flow_control: str, baudrate: int, flush: bool = True
+    ) -> None:
         self._log_device_info(device)
         self._serial = serial.Serial(
             port=device,
@@ -140,10 +146,14 @@ class HardwareDevice:
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
             xonxoff=flow_control == "software",
-            rtscts=flow_control == "ctsrts",
+            rtscts=flow_control == "rtscts",
             timeout=1.0,
             write_timeout=1.0,
         )
+        if flush:
+            self._serial.reset_input_buffer()
+            self._serial.reset_output_buffer()
+            logger.debug("Flushed serial buffers")
         logger.debug(
             "Serial port settings: baudrate=%s, bytesize=%s, parity=%s, stopbits=%s, rtscts=%s",
             self._serial.baudrate,
@@ -311,7 +321,7 @@ def run_test(dev: SerialDevice, duration: int, warmup: int) -> int:
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
-    """Add baudrate, duration, and warmup arguments to a parser."""
+    """Add baudrate, duration, warmup, and flush arguments to a parser."""
     parser.add_argument(
         "-b",
         "--baudrate",
@@ -332,6 +342,12 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_WARMUP_S,
         help=f"Warmup period in seconds to wait for peer (default: {DEFAULT_WARMUP_S})",
+    )
+    parser.add_argument(
+        "--flush",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Flush serial buffers on start (default: flush)",
     )
 
 
@@ -363,20 +379,20 @@ Examples:
         "-f",
         "--flow-control",
         type=str,
-        choices=["none", "ctsrts", "software"],
-        default="ctsrts",
-        help="Flow control (default: ctsrts)",
+        choices=["none", "rtscts", "software"],
+        default="rtscts",
+        help="Flow control (default: rtscts)",
     )
     _add_common_args(parser)
 
     args = parser.parse_args()
 
     if args.mode == "loopback":
-        dev: SerialDevice = LoopbackDevice(args.baudrate)
+        dev: SerialDevice = LoopbackDevice(args.baudrate, args.flush)
         return run_test(dev, args.duration, args.warmup)
 
     if args.device:
-        dev = HardwareDevice(args.device, args.flow_control, args.baudrate)
+        dev = HardwareDevice(args.device, args.flow_control, args.baudrate, args.flush)
         return run_test(dev, args.duration, args.warmup)
 
     parser.print_help()
