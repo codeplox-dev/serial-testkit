@@ -5,25 +5,139 @@ import argparse
 import logging
 import os
 import pty
-import signal
 import sys
 import threading
 import time
 from dataclasses import dataclass
-from types import FrameType
 from typing import Protocol
 
 import serial
 import serial.tools.list_ports
 
 import message
+import peering
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
 DEFAULT_BAUDRATE = 115200
 DEFAULT_DURATION_S = 15
 DEFAULT_WARMUP_S = 20
+THROUGHPUT_MIN_DURATION_S = 30
+
+# -----------------------------------------------------------------------------
+# Experimental: FTDI Latency Timer Configuration
+# -----------------------------------------------------------------------------
+#
+# FTDI USB-serial adapters (FT232R, FT232RL, etc.) have a known issue with
+# hardware flow control (RTS/CTS). The chip has an internal 256-byte buffer
+# and a latency timer that controls how often data is flushed to the host.
+#
+# Default latency timer is 16ms, which can cause flow control timing issues:
+# - The CTS signal may not be processed quickly enough
+# - Buffer overflows can occur before CTS is asserted
+# - Write timeouts happen even with correct wiring
+#
+# Setting the latency timer to 1ms significantly improves RTS/CTS reliability
+# by reducing the response time to flow control signals.
+#
+# This is controlled via sysfs:
+#   /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+#
+# References:
+# - Linux Kernel Bug #197109: ftdi_sio RTS/CTS issues
+# - FTDI Application Note AN232B-04: Data Throughput, Latency and Handshaking
+#
+# This feature is EXPERIMENTAL because:
+# - Requires root privileges to modify sysfs
+# - May not work on all systems or kernel versions
+# - Only applies to FTDI devices (not native UARTs like ttyAMA*)
+# -----------------------------------------------------------------------------
+
+FTDI_LATENCY_TIMER_TARGET = 1  # Target latency timer value in milliseconds
+
+
+def configure_ftdi_latency_timer(device: str) -> bool:
+    """
+    Attempt to configure FTDI latency timer to improve RTS/CTS reliability.
+
+    This is an EXPERIMENTAL feature that reduces the FTDI chip's internal
+    buffer latency from 16ms to 1ms, improving hardware flow control timing.
+
+    Args:
+        device: Serial device path (e.g., /dev/ttyUSB0)
+
+    Returns:
+        True if configuration was successful, False otherwise.
+
+    Note:
+        - Requires root privileges
+        - Only works for FTDI USB-serial devices
+        - Setting is volatile (resets on device disconnect)
+    """
+    # Extract device name (e.g., "ttyUSB0" from "/dev/ttyUSB0")
+    device_name = os.path.basename(device)
+
+    # Only applicable to USB serial devices
+    if not device_name.startswith("ttyUSB"):
+        logger.debug(f"Latency fix not applicable to {device_name} (not a USB serial device)")
+        return False
+
+    sysfs_path = f"/sys/bus/usb-serial/devices/{device_name}/latency_timer"
+
+    # Check if sysfs path exists
+    if not os.path.exists(sysfs_path):
+        logger.warning(f"Cannot configure latency timer: {sysfs_path} not found")
+        return False
+
+    try:
+        # Read current value
+        with open(sysfs_path, "r") as f:
+            current_value = int(f.read().strip())
+
+        if current_value == FTDI_LATENCY_TIMER_TARGET:
+            logger.debug(f"Latency timer already set to {FTDI_LATENCY_TIMER_TARGET}ms")
+            return True
+
+        # Attempt to write new value
+        with open(sysfs_path, "w") as f:
+            f.write(str(FTDI_LATENCY_TIMER_TARGET))
+
+        # Verify the change
+        with open(sysfs_path, "r") as f:
+            new_value = int(f.read().strip())
+
+        if new_value == FTDI_LATENCY_TIMER_TARGET:
+            logger.info(
+                f"EXPERIMENTAL: Set FTDI latency timer from {current_value}ms to "
+                f"{FTDI_LATENCY_TIMER_TARGET}ms for improved RTS/CTS reliability"
+            )
+            return True
+        else:
+            logger.warning(
+                f"Failed to set latency timer: wrote {FTDI_LATENCY_TIMER_TARGET}, "
+                f"read back {new_value}"
+            )
+            return False
+
+    except PermissionError:
+        logger.warning(
+            f"Cannot configure latency timer: permission denied. "
+            f"Run with sudo to enable this experimental feature."
+        )
+        return False
+    except Exception as e:
+        logger.warning(f"Failed to configure latency timer: {e}")
+        return False
+
+
+# -----------------------------------------------------------------------------
+# Data classes
+# -----------------------------------------------------------------------------
 
 
 @dataclass
@@ -37,6 +151,55 @@ class LatencyStats:
     p50_ms: float
     p95_ms: float
     p99_ms: float
+
+
+@dataclass
+class TestResult:
+    """Results from a test run."""
+
+    sent: int
+    received: int
+    crc_ok: int
+    bytes_transferred: int
+    elapsed_s: float
+    rtt_samples: list[float]
+    peer_complete_received: bool  # True if we received PEER_COMPLETE from peer
+    peer_complete_sent: bool  # True if we sent PEER_COMPLETE to peer
+    is_leader: bool  # True if this node controlled the test duration
+    test_id: int  # Hash of initiator's nanosecond start time
+
+    @property
+    def clean_exit(self) -> bool:
+        """True if test ended cleanly (peer complete exchanged)."""
+        return self.peer_complete_received or self.peer_complete_sent
+
+    @property
+    def crc_pass_rate(self) -> float:
+        """CRC pass rate as percentage (0-100)."""
+        return (self.crc_ok / self.received * 100) if self.received else 0.0
+
+    @property
+    def success(self) -> bool:
+        """True if test was successful (clean exit + 100% CRC)."""
+        return self.clean_exit and self.received > 0 and self.crc_ok == self.received
+
+
+@dataclass
+class TestStats:
+    """Statistics collected during test execution."""
+
+    sent: int
+    received: int
+    crc_ok: int
+    bytes_transferred: int
+    rtt_samples: list[float]
+    peer_complete_received: bool
+    peer_complete_sent: bool
+
+
+# -----------------------------------------------------------------------------
+# Utility functions
+# -----------------------------------------------------------------------------
 
 
 def compute_latency_stats(rtt_samples: list[float]) -> LatencyStats | None:
@@ -65,12 +228,28 @@ def compute_latency_stats(rtt_samples: list[float]) -> LatencyStats | None:
     )
 
 
+# -----------------------------------------------------------------------------
+# Serial device abstraction
+# -----------------------------------------------------------------------------
+
+
 class SerialDevice(Protocol):
     """Protocol for serial device implementations."""
+
+    @property
+    def cts_state(self) -> bool | None:
+        """CTS line state (None if not using hardware flow control)."""
+        ...
+
+    @property
+    def out_waiting(self) -> int:
+        """Bytes waiting in output buffer."""
+        ...
 
     def close(self) -> None: ...
     def write_msg(self, payload: bytes) -> int: ...
     def read_msg(self) -> tuple[bytes | None, bool]: ...
+    def flush_buffers(self) -> None: ...
 
 
 def _write_msg(ser: serial.Serial, payload: bytes) -> int:
@@ -95,7 +274,7 @@ class LoopbackDevice:
         self._serial = serial.Serial(
             slave_name,
             baudrate=baudrate,
-            timeout=1.0,
+            timeout=0.1,  # Short timeout to prevent buffer overflow
             write_timeout=1.0,
             xonxoff=False,
             rtscts=False,
@@ -118,6 +297,16 @@ class LoopbackDevice:
             except OSError:
                 break
 
+    @property
+    def cts_state(self) -> bool | None:
+        """CTS not applicable for loopback device."""
+        return None
+
+    @property
+    def out_waiting(self) -> int:
+        """Return bytes waiting in output buffer."""
+        return self._serial.out_waiting
+
     def close(self) -> None:
         self._running = False
         if self._serial.is_open:
@@ -130,6 +319,10 @@ class LoopbackDevice:
 
     def read_msg(self) -> tuple[bytes | None, bool]:
         return _read_msg(self._serial)
+
+    def flush_buffers(self) -> None:
+        self._serial.reset_input_buffer()
+        self._serial.reset_output_buffer()
 
 
 class HardwareDevice:
@@ -145,9 +338,9 @@ class HardwareDevice:
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            xonxoff=flow_control == "software",
-            rtscts=flow_control == "rtscts",
-            timeout=1.0,
+            xonxoff=False,  # Software flow control incompatible with binary data
+            rtscts=flow_control == "crtscts",
+            timeout=0.1,  # Short timeout to prevent buffer overflow
             write_timeout=1.0,
         )
         if flush:
@@ -162,6 +355,15 @@ class HardwareDevice:
             self._serial.stopbits,
             self._serial.rtscts,
         )
+        # Check initial CTS state when using hardware flow control
+        if self._serial.rtscts:
+            if self._serial.cts:
+                logger.debug("CTS asserted at startup")
+            else:
+                logger.warning(
+                    "CTS not asserted at startup - peer may not be connected "
+                    "or not configured for hardware flow control"
+                )
 
     @staticmethod
     def _log_device_info(device: str) -> None:
@@ -188,6 +390,18 @@ class HardwareDevice:
         if info.serial_number:
             logger.info(f"Serial Number: {info.serial_number}")
 
+    @property
+    def cts_state(self) -> bool | None:
+        """Query CTS line state. Returns None if not using hardware flow control."""
+        if not self._serial.rtscts:
+            return None
+        return self._serial.cts
+
+    @property
+    def out_waiting(self) -> int:
+        """Return bytes waiting in output buffer."""
+        return self._serial.out_waiting
+
     def close(self) -> None:
         if self._serial.is_open:
             name = self._serial.name
@@ -200,97 +414,236 @@ class HardwareDevice:
     def read_msg(self) -> tuple[bytes | None, bool]:
         return _read_msg(self._serial)
 
+    def flush_buffers(self) -> None:
+        self._serial.reset_input_buffer()
+        self._serial.reset_output_buffer()
 
-def run_loop(
-    dev: SerialDevice, duration_s: int, warmup_s: int = DEFAULT_WARMUP_S
-) -> tuple[int, int, int, int, float, list[float]]:
-    """Run send/receive loop until duration expires or SIGINT.
 
-    Returns (sent, received, crc_ok, bytes_transferred, elapsed_s, rtt_samples).
+# -----------------------------------------------------------------------------
+# Test execution
+# -----------------------------------------------------------------------------
 
-    rtt_samples contains the round-trip time in seconds for each successful
-    message exchange. Timeouts are not included.
 
-    During warmup_s, write timeouts are tolerated (retried) while waiting for peer.
-    After warmup, write timeouts raise SerialTimeoutException.
+PEER_COMPLETE_SEND_COUNT = 3  # Send PEER_COMPLETE multiple times for reliability
 
-    Stats counting begins only after peer detection (first successful read), so messages
-    sent during warmup before the peer is ready are not counted.
+
+def _run_test_loop(
+    dev: SerialDevice,
+    peer_info: peering.PeerInfo,
+) -> TestStats:
+    """Execute the test loop, sending and receiving data messages.
+
+    Initiator: runs for duration_s, then sends PEER_COMPLETE (multiple times).
+    Responder: runs until PEER_COMPLETE received or safety timeout.
+
+    All messages include test_id; messages with wrong test_id are ignored.
+    If responder receives PEER_INIT during test, it re-sends PEER_ACK (lost ACK recovery).
     """
     sent, received, crc_ok = 0, 0, 0
     bytes_transferred = 0
     rtt_samples: list[float] = []
-    running = True
-    start_time = time.monotonic()
-    stats_start_time: float | None = None
-    peer_detected = False
-    warmup_logged = False
+    peer_complete_received = False
+    peer_complete_sent = False
+    write_timeout_count = 0
+    cts_false_count = 0
+    test_start = time.monotonic()
 
-    def handler(_sig: int, _frame: FrameType | None) -> None:
-        nonlocal running
-        running = False
+    # Responder safety timeout: prevents infinite loop if PEER_COMPLETE is lost
+    responder_max_duration = (
+        peer_info.duration_s * peering.RESPONDER_TIMEOUT_MULTIPLIER
+    )
 
-    signal.signal(signal.SIGINT, handler)
+    while True:
+        test_elapsed = time.monotonic() - test_start
 
-    while running and (duration_s == 0 or (time.monotonic() - start_time) < duration_s):
-        elapsed = time.monotonic() - start_time
-        in_warmup = elapsed < warmup_s
+        # Initiator: check if duration expired
+        if peer_info.is_initiator and test_elapsed >= peer_info.duration_s:
+            logger.info("Test duration complete, signaling peer...")
+            # Send PEER_COMPLETE multiple times for reliability
+            for i in range(PEER_COMPLETE_SEND_COUNT):
+                try:
+                    dev.write_msg(peering.make_peer_complete(peer_info.test_id))
+                    peer_complete_sent = True
+                except serial.SerialTimeoutException:
+                    logger.warning(f"Timeout sending peer complete signal (attempt {i+1})")
+            break
 
+        # Responder: check safety timeout
+        if not peer_info.is_initiator and test_elapsed >= responder_max_duration:
+            logger.warning(
+                f"Responder safety timeout after {test_elapsed:.1f}s "
+                f"(expected PEER_COMPLETE within {responder_max_duration}s)"
+            )
+            break
+
+        # Send a data message
         try:
-            payload_out = message.random_payload()
             msg_start = time.monotonic()
+            payload_out = peering.make_data_msg(peer_info.test_id)
             dev.write_msg(payload_out)
-        except serial.SerialTimeoutException:
-            if in_warmup:
-                if not warmup_logged:
-                    logger.info("Waiting for peer...")
-                    warmup_logged = True
-                continue
-            raise
-
-        # Only count sent after peer is detected (first successful read)
-        if peer_detected:
             sent += 1
-            # Count bytes: payload + 8 bytes protocol overhead (4-byte length + 4-byte CRC)
-            bytes_transferred += len(payload_out) + 8
-
-        payload, ok = dev.read_msg()
-        if payload is not None:
-            if not peer_detected:
-                logger.info("Peer detected")
-                peer_detected = True
-                stats_start_time = time.monotonic()
+            bytes_transferred += len(payload_out) + 8  # +8 for length+CRC
+        except serial.SerialTimeoutException:
+            write_timeout_count += 1
+            cts = dev.cts_state
+            out_waiting = dev.out_waiting
+            if cts is None:
+                # Not using hardware flow control
+                logger.warning("Write timeout (no flow control)")
+            elif not cts:
+                cts_false_count += 1
+                logger.warning(
+                    f"Write timeout - CTS not asserted (out_waiting={out_waiting}). "
+                    "Check RTS/CTS wiring or try -f none"
+                )
             else:
-                # Only count received after peer was already detected
+                logger.warning(
+                    f"Write timeout despite CTS asserted (out_waiting={out_waiting}). "
+                    "Possible kernel/driver issue"
+                )
+            continue
+
+        # Try to read a message
+        payload, crc_ok_flag = dev.read_msg()
+        if payload is None:
+            continue
+
+        # Handle received message
+        match peering.classify_test_message(payload, peer_info.test_id):
+            case peering.MessageResult.COMPLETE:
+                logger.info("Received peer complete signal")
+                peer_complete_received = True
+                break
+            case peering.MessageResult.PEER_INIT:
+                # Initiator may not have received our ACK - re-send it
+                if not peer_info.is_initiator:
+                    logger.debug("Re-sending PEER_ACK (initiator may have missed it)")
+                    try:
+                        dev.write_msg(peering.make_peer_ack(peer_info.test_id))
+                    except serial.SerialTimeoutException:
+                        pass
+            case peering.MessageResult.DATA:
                 rtt_samples.append(time.monotonic() - msg_start)
                 received += 1
                 bytes_transferred += len(payload) + 8
-                if ok:
+                if crc_ok_flag:
                     crc_ok += 1
+            case peering.MessageResult.IGNORE:
+                pass
 
-    elapsed_s = (time.monotonic() - stats_start_time) if stats_start_time else 0.0
-    return sent, received, crc_ok, bytes_transferred, elapsed_s, rtt_samples
+    # Report flow control diagnostics if issues occurred
+    if write_timeout_count > 0:
+        logger.info(
+            f"Flow control stats: {write_timeout_count} write timeouts, "
+            f"{cts_false_count} with CTS not asserted"
+        )
+
+    return TestStats(
+        sent=sent,
+        received=received,
+        crc_ok=crc_ok,
+        bytes_transferred=bytes_transferred,
+        rtt_samples=rtt_samples,
+        peer_complete_received=peer_complete_received,
+        peer_complete_sent=peer_complete_sent,
+    )
 
 
-THROUGHPUT_MIN_DURATION_S = 30
+def run_loop(
+    dev: SerialDevice,
+    duration_s: int,
+    warmup_s: int = DEFAULT_WARMUP_S,
+    is_loopback: bool = False,
+) -> TestResult:
+    """Run the complete test: peer establishment then data exchange.
+
+    Protocol:
+    1. Peer establishment: exchange PEER_INIT, determine roles via timestamp
+    2. Test phase: exchange data messages with test_id prefix
+    3. Completion: initiator sends PEER_COMPLETE after duration expires
+
+    Loopback mode skips peer establishment (always initiator).
+    Exit code 0 requires: clean completion + 100% CRC pass rate.
+    """
+    our_timestamp_ns = time.time_ns()
+
+    # Determine peer info (establish peer or loopback)
+    peer_info: peering.PeerInfo
+    if is_loopback:
+        test_id = peering.make_test_id(our_timestamp_ns)
+        peer_info = peering.PeerInfo(
+            is_initiator=True, test_id=test_id, duration_s=duration_s
+        )
+        logger.info(f"Loopback mode (test_id={test_id:016x}, duration: {duration_s}s)")
+    else:
+        maybe_peer_info = peering.establish_peer(
+            dev, our_timestamp_ns, duration_s, warmup_s
+        )
+        if maybe_peer_info is None:
+            return TestResult(
+                sent=0,
+                received=0,
+                crc_ok=0,
+                bytes_transferred=0,
+                elapsed_s=0.0,
+                rtt_samples=[],
+                peer_complete_received=False,
+                peer_complete_sent=False,
+                is_leader=False,
+                test_id=0,
+            )
+        peer_info = maybe_peer_info
+
+    # Run the test loop
+    test_start = time.monotonic()
+    stats = _run_test_loop(dev, peer_info)
+    elapsed_s = time.monotonic() - test_start
+
+    return TestResult(
+        sent=stats.sent,
+        received=stats.received,
+        crc_ok=stats.crc_ok,
+        bytes_transferred=stats.bytes_transferred,
+        elapsed_s=elapsed_s,
+        rtt_samples=stats.rtt_samples,
+        peer_complete_received=stats.peer_complete_received,
+        peer_complete_sent=stats.peer_complete_sent,
+        is_leader=peer_info.is_initiator,
+        test_id=peer_info.test_id,
+    )
 
 
-def report(stats: tuple[int, int, int, int, float, list[float]]) -> None:
+# -----------------------------------------------------------------------------
+# Reporting
+# -----------------------------------------------------------------------------
+
+
+def report(result: TestResult) -> None:
     """Print statistics from run_loop."""
-    sent, received, crc_ok, bytes_transferred, elapsed_s, rtt_samples = stats
-    pct = (crc_ok / received * 100) if received else 0
-    print(f"sent={sent} recv={received} ok={crc_ok} ({pct:.1f}%)")
-    if sent != received:
-        print("(Note: sent/recv counts differ due to in-flight message when one side stopped first)")
-    if elapsed_s > 0 and bytes_transferred > 0:
+    print(
+        f"sent={result.sent} recv={result.received} ok={result.crc_ok} "
+        f"({result.crc_pass_rate:.1f}%)"
+    )
+    if result.sent != result.received:
+        print(
+            "(Note: sent/recv counts differ due to in-flight message "
+            "when one side stopped first)"
+        )
+    if result.elapsed_s > 0 and result.bytes_transferred > 0:
         # For 8N1 UART: each byte needs 10 bits on wire (1 start + 8 data + 1 stop)
-        bytes_per_sec = bytes_transferred / elapsed_s
+        bytes_per_sec = result.bytes_transferred / result.elapsed_s
         baud = bytes_per_sec * 10
-        kbps = (bytes_transferred * 8 / elapsed_s) / 1000
-        print(f"throughput: {baud:,.0f} baud ({kbps:.2f} Kbps) over {elapsed_s:.1f}s")
-        if elapsed_s < THROUGHPUT_MIN_DURATION_S:
-            print("(Note: throughput from short test may not reflect sustained performance)")
-    latency = compute_latency_stats(rtt_samples)
+        kbps = (result.bytes_transferred * 8 / result.elapsed_s) / 1000
+        print(
+            f"throughput: {baud:,.0f} baud ({kbps:.2f} Kbps) "
+            f"over {result.elapsed_s:.1f}s"
+        )
+        if result.elapsed_s < THROUGHPUT_MIN_DURATION_S:
+            print(
+                "(Note: throughput from short test may not reflect "
+                "sustained performance)"
+            )
+    latency = compute_latency_stats(result.rtt_samples)
     if latency:
         print(
             f"latency: avg={latency.avg_ms:.2f}ms min={latency.min_ms:.2f}ms "
@@ -300,16 +653,43 @@ def report(stats: tuple[int, int, int, int, float, list[float]]) -> None:
             f"         p50={latency.p50_ms:.2f}ms p95={latency.p95_ms:.2f}ms "
             f"p99={latency.p99_ms:.2f}ms (n={latency.count})"
         )
+    # Report role and completion status
+    role = "initiator" if result.is_leader else "responder"
+    if result.peer_complete_received:
+        print(f"(Role: {role}, peer signaled test complete)")
+    elif result.peer_complete_sent:
+        print(f"(Role: {role}, signaled peer test complete)")
+    elif not result.clean_exit:
+        print(f"(Role: {role}, warning: test did not complete cleanly)")
 
 
-def run_test(dev: SerialDevice, duration: int, warmup: int) -> int:
-    """Run the test loop and report results."""
+def run_test(
+    dev: SerialDevice, duration: int, warmup: int, is_loopback: bool = False
+) -> int:
+    """Run the test loop and report results.
+
+    Returns:
+        0 if test completed successfully (clean exit + 100% CRC)
+        1 if test failed (errors, no peer, or CRC failures)
+    """
     try:
         logger.info("Serial device ready")
-        duration_msg = "indefinitely" if duration == 0 else f"for {duration}s"
-        logger.info(f"Running test loop {duration_msg} (Ctrl-C to stop)")
-        report(run_loop(dev, duration, warmup))
-        return 0
+        result = run_loop(dev, duration, warmup, is_loopback)
+        report(result)
+
+        if result.success:
+            logger.info("Test completed successfully")
+            return 0
+        else:
+            if not result.clean_exit:
+                logger.error("Test did not complete cleanly")
+            elif result.received == 0:
+                logger.error("No messages received")
+            else:
+                logger.error(
+                    f"CRC failures: {result.received - result.crc_ok}/{result.received}"
+                )
+            return 1
     except serial.SerialException as e:
         logger.error(f"Serial error: {e}")
         return 1
@@ -320,26 +700,42 @@ def run_test(dev: SerialDevice, duration: int, warmup: int) -> int:
         dev.close()
 
 
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+
+def _positive_int(value: str) -> int:
+    """Validate that a value is a positive integer."""
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: '{value}'")
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {ivalue}")
+    return ivalue
+
+
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add baudrate, duration, warmup, and flush arguments to a parser."""
     parser.add_argument(
         "-b",
         "--baudrate",
-        type=int,
+        type=_positive_int,
         default=DEFAULT_BAUDRATE,
         help=f"Baud rate (default: {DEFAULT_BAUDRATE})",
     )
     parser.add_argument(
         "-t",
         "--duration",
-        type=int,
+        type=_positive_int,
         default=DEFAULT_DURATION_S,
-        help=f"Duration in seconds, 0 = indefinite (default: {DEFAULT_DURATION_S})",
+        help=f"Test duration in seconds (default: {DEFAULT_DURATION_S})",
     )
     parser.add_argument(
         "-w",
         "--warmup",
-        type=int,
+        type=_positive_int,
         default=DEFAULT_WARMUP_S,
         help=f"Warmup period in seconds to wait for peer (default: {DEFAULT_WARMUP_S})",
     )
@@ -379,9 +775,14 @@ Examples:
         "-f",
         "--flow-control",
         type=str,
-        choices=["none", "rtscts", "software"],
-        default="rtscts",
-        help="Flow control (default: rtscts)",
+        choices=["none", "crtscts"],
+        default="crtscts",
+        help="Flow control (default: crtscts)",
+    )
+    parser.add_argument(
+        "--no-latency-fix",
+        action="store_true",
+        help="Disable automatic FTDI latency timer configuration (1ms for reliable RTS/CTS)",
     )
     _add_common_args(parser)
 
@@ -389,9 +790,13 @@ Examples:
 
     if args.mode == "loopback":
         dev: SerialDevice = LoopbackDevice(args.baudrate, args.flush)
-        return run_test(dev, args.duration, args.warmup)
+        return run_test(dev, args.duration, args.warmup, is_loopback=True)
 
     if args.device:
+        # Apply FTDI latency fix by default (disable with --no-latency-fix)
+        if not getattr(args, "no_latency_fix", False):
+            configure_ftdi_latency_timer(args.device)
+
         dev = HardwareDevice(args.device, args.flow_control, args.baudrate, args.flush)
         return run_test(dev, args.duration, args.warmup)
 

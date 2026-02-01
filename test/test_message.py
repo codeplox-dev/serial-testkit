@@ -57,22 +57,31 @@ class TestEncodeDecode(unittest.TestCase):
     def test_encoded_format(self) -> None:
         payload = b"test"
         encoded = message.encode(payload)
-        # Should be: 4-byte length + payload + 4-byte CRC
-        self.assertEqual(len(encoded), 4 + len(payload) + 4)
-        # First 4 bytes should be length (4 in little-endian)
-        self.assertEqual(encoded[:4], b"\x04\x00\x00\x00")
+        # Should be: 4-byte sync + 4-byte length + payload + 4-byte CRC
+        self.assertEqual(len(encoded), 4 + 4 + len(payload) + 4)
+        # First 4 bytes should be sync magic
+        self.assertEqual(encoded[:4], message.SYNC_MAGIC_BYTES)
+        # Next 4 bytes should be length (4 in little-endian)
+        self.assertEqual(encoded[4:8], b"\x04\x00\x00\x00")
         # Next bytes should be payload
-        self.assertEqual(encoded[4:8], b"test")
+        self.assertEqual(encoded[8:12], b"test")
+
+    def test_decode_truncated_sync(self) -> None:
+        reader = io.BytesIO(b"\x00\x10")  # Only 2 bytes, need 4 for sync
+        decoded, ok = message.decode(reader)
+        self.assertIsNone(decoded)
+        self.assertFalse(ok)
 
     def test_decode_truncated_length(self) -> None:
-        reader = io.BytesIO(b"\x04\x00")  # Only 2 bytes, need 4
+        # Valid sync magic but truncated length
+        reader = io.BytesIO(message.SYNC_MAGIC_BYTES + b"\x04\x00")
         decoded, ok = message.decode(reader)
         self.assertIsNone(decoded)
         self.assertFalse(ok)
 
     def test_decode_truncated_payload(self) -> None:
-        # Length says 10 bytes, but only 5 provided
-        reader = io.BytesIO(b"\x0a\x00\x00\x00hello")
+        # Valid sync + length says 10 bytes, but only 5 provided
+        reader = io.BytesIO(message.SYNC_MAGIC_BYTES + b"\x0a\x00\x00\x00hello")
         decoded, ok = message.decode(reader)
         self.assertIsNone(decoded)
         self.assertFalse(ok)
@@ -86,6 +95,37 @@ class TestEncodeDecode(unittest.TestCase):
         decoded, ok = message.decode(reader)
         # Should return payload but with ok=False
         self.assertEqual(decoded, payload)
+        self.assertFalse(ok)
+
+    def test_resync_with_garbage_prefix(self) -> None:
+        """Test that decoder can resync after garbage bytes."""
+        payload = b"hello"
+        encoded = message.encode(payload)
+        # Prepend some garbage bytes
+        garbage = b"\x00\x01\x02\x03\x04\x05"
+        reader = io.BytesIO(garbage + encoded)
+        decoded, ok = message.decode(reader)
+        self.assertTrue(ok)
+        self.assertEqual(decoded, payload)
+
+    def test_resync_with_partial_message_prefix(self) -> None:
+        """Test that decoder can resync when stream starts mid-message."""
+        payload = b"hello"
+        encoded = message.encode(payload)
+        # Simulate starting mid-message: partial sync + garbage + valid message
+        partial = b"\x5A\x10\x00\xff\xff"  # Looks like part of sync magic
+        reader = io.BytesIO(partial + encoded)
+        decoded, ok = message.decode(reader)
+        self.assertTrue(ok)
+        self.assertEqual(decoded, payload)
+
+    def test_decode_huge_length_rejected(self) -> None:
+        """Test that unreasonably large length values are rejected."""
+        # Valid sync but huge length
+        huge_length = message.uint32_to_bytes(message.MAX_MESSAGE_LENGTH + 1)
+        reader = io.BytesIO(message.SYNC_MAGIC_BYTES + huge_length + b"x" * 100)
+        decoded, ok = message.decode(reader)
+        self.assertIsNone(decoded)
         self.assertFalse(ok)
 
 

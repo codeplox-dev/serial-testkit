@@ -1,2 +1,4 @@
 .venv
+.secenvrc
 *cache*/
+duration-test-results/
