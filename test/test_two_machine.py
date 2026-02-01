@@ -4,9 +4,7 @@ Test two-machine mode using a fake tty pair created with socat.
 Requires: socat, Linux
 """
 
-import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -48,24 +46,17 @@ class TestTwoMachine(unittest.TestCase):
             len(ptys), 2, f"Failed to get pty pair from socat, got: {ptys}"
         )
 
-        # Start two instances of serial.py with no flow control
+        # Start two instances of serial.py with no flow control and short duration
         procs: list[subprocess.Popen[str]] = []
         for pty in ptys:
             proc = subprocess.Popen(
-                [sys.executable, str(_SERIAL), "-d", pty, "-f", "none"],
+                [sys.executable, str(_SERIAL), "-d", pty, "-f", "none", "-t", "3"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
             procs.append(proc)
             self.addCleanup(self._terminate_process, proc)
-
-        # Let them run
-        time.sleep(3)
-
-        # Send SIGINT to both
-        for proc in procs:
-            os.kill(proc.pid, signal.SIGINT)
 
         # Collect and verify results
         for i, proc in enumerate(procs):

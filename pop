@@ -26,6 +26,7 @@ Usage: $(basename "$0") <operation> [args...]
 
 Operations:
   setup              Create virtualenv and install dependencies
+  clean              Remove cache directories (__pycache__, .pytest_cache, etc.)
   distclean          Remove virtualenv and all cache directories
   test               Run the test suite
   run [args]         Run serial test (args passed to serialtest.py)
@@ -65,14 +66,21 @@ ensure_setup() {
     fi
 }
 
-cmd_distclean() {
-    echo "Removing virtualenv and cache directories..."
-    rm -rf "$VENV_DIR"
+cmd_clean() {
+    echo "Removing cache directories..."
     rm -rf "$SCRIPT_DIR"/__pycache__
+    rm -rf "$SCRIPT_DIR"/*/__pycache__
     rm -rf "$SCRIPT_DIR"/.mypy_cache
     rm -rf "$SCRIPT_DIR"/.pytest_cache
     rm -rf "$SCRIPT_DIR"/.ruff_cache
-    echo "Clean complete."
+    echo "Cache clean complete."
+}
+
+cmd_distclean() {
+    cmd_clean
+    echo "Removing virtualenv..."
+    rm -rf "$VENV_DIR"
+    echo "Distclean complete."
 }
 
 cmd_test() {
@@ -100,6 +108,9 @@ fi
 case "$1" in
     setup)
         cmd_setup
+        ;;
+    clean)
+        cmd_clean
         ;;
     distclean)
         cmd_distclean
