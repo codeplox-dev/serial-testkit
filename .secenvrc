@@ -1,0 +1,3 @@
+export SERIAL_RPI_PASSWORD="cheeser"
+export SERIAL_RPI_USER="admin"
+export SERIAL_RPI_HOST="10.109.41.47"

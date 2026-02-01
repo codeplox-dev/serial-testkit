@@ -11,9 +11,8 @@ All integers are little-endian unsigned 32-bit.
 
 import logging
 import random
-from typing import Literal, Protocol
-
 import zlib
+from typing import Literal, Protocol
 
 logger = logging.getLogger(__name__)
 
