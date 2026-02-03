@@ -28,16 +28,17 @@ Operations:
   setup              Create virtualenv and install dependencies
   clean              Remove cache directories (__pycache__, .pytest_cache, etc.)
   distclean          Remove virtualenv and all cache directories
-  test               Run the test suite
+  test               Run all tests (unit + integration)
+  test-unit          Run unit tests only (fast, no socat required)
+  test-integration   Run integration tests only (requires Linux + socat)
   run [args]         Run serial test (args passed to serialtest.py)
   help               Show this help message
 
 Examples:
-  ./pop run loopback
-  ./pop run -d /dev/ttyAMA4
-  ./pop run -d /dev/ttyUSB0 -b 9600 -t 30
+  ./pop run -d /dev/ttyAMA4 -r server          # Run as server
+  ./pop run -d /dev/ttyUSB0 -r client -n 100   # Run as client with msg count
 
-Run './pop run --help' for run options (device, baudrate, duration, etc.)
+Run './pop run --help' for run options (device, role, baudrate, etc.)
 EOF
 }
 
@@ -86,8 +87,28 @@ cmd_distclean() {
 cmd_test() {
     ensure_setup
     echo "Running tests..."
-    if ! "$PYTHON" -m unittest discover -s "$SCRIPT_DIR/test" -v; then
+    # Run all tests with pytest; integration tests requiring Linux will be
+    # automatically skipped on non-Linux platforms via @pytest.mark.skipif
+    if ! "$PYTHON" -m pytest "$SCRIPT_DIR/test" -v; then
         echo "Error: Tests failed." >&2
+        exit $EXIT_RUN_FAILED
+    fi
+}
+
+cmd_test_unit() {
+    ensure_setup
+    echo "Running unit tests..."
+    if ! "$PYTHON" -m pytest "$SCRIPT_DIR/test" -m unit -v; then
+        echo "Error: Unit tests failed." >&2
+        exit $EXIT_RUN_FAILED
+    fi
+}
+
+cmd_test_integration() {
+    ensure_setup
+    echo "Running integration tests..."
+    if ! "$PYTHON" -m pytest "$SCRIPT_DIR/test" -m integration -v; then
+        echo "Error: Integration tests failed." >&2
         exit $EXIT_RUN_FAILED
     fi
 }
@@ -117,6 +138,12 @@ case "$1" in
         ;;
     test)
         cmd_test
+        ;;
+    test-unit)
+        cmd_test_unit
+        ;;
+    test-integration)
+        cmd_test_integration
         ;;
     run)
         shift

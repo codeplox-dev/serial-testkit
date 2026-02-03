@@ -1,383 +1,647 @@
-#!/usr/bin/env python3
-"""Tests for peer establishment protocol using fake pty pairs.
+"""Unit tests for the peering module."""
 
-These tests verify the peering protocol handles various timing scenarios:
-- Simultaneous start (both peers start at nearly the same time)
-- Staggered start (one peer starts before the other)
-- Timeout scenarios
-"""
+import pytest
 
-import re
-import subprocess
-import sys
-import time
-import unittest
-from pathlib import Path
+from client.handshake import (
+    HandshakeError,
+    client_handshake,
+    client_send_syn_wait_syn_ack,
+)
+from client.shutdown import client_shutdown
+from common import message
+from common.connection import Connection, ConnectionMismatchError, PeeringError, Role, SessionParams
+from common.encoding import (
+    EncodingError,
+    TransportError,
+    decode_ack_with_params,
+    decode_message,
+    encode_ack_with_params,
+    encode_control,
+    encode_data,
+    generate_connection_id,
+)
+from common.io import drain_input, recv_data, send_data
+from common.protocol import MsgType
+from server.handshake import (
+    server_handshake,
+    server_send_syn_ack_wait_ack,
+    server_wait_for_syn,
+)
+from server.shutdown import server_shutdown
+from test.conftest import MockSerialPort
 
-# Path to serialtest.py (parent directory of test/)
-_SCRIPT_DIR = Path(__file__).parent.parent
-_SERIAL = _SCRIPT_DIR / "serialtest.py"
+
+@pytest.mark.unit
+class TestMsgType:
+    """Tests for MsgType enum."""
+
+    def test_values(self) -> None:
+        assert MsgType.SYN == 0x01
+        assert MsgType.SYN_ACK == 0x02
+        assert MsgType.ACK == 0x03
+        assert MsgType.DATA == 0x10
+        assert MsgType.FIN == 0x20
+        assert MsgType.FIN_ACK == 0x21
 
 
-class TestPeeringProtocol(unittest.TestCase):
-    """Test peer establishment with various timing scenarios."""
+@pytest.mark.unit
+class TestEncoding:
+    """Tests for message encoding functions."""
 
-    @unittest.skipUnless(sys.platform == "linux", "Requires Linux")
-    def test_simultaneous_start(self) -> None:
-        """Both peers start at nearly the same time."""
-        socat, ptys = self._create_pty_pair()
-        self.addCleanup(self._terminate_process, socat)
+    def test_encode_control_syn(self) -> None:
+        conn_id = b"\x01\x02\x03\x04"
+        encoded = encode_control(MsgType.SYN, conn_id)
+        # Should be: sync(4) + length(4) + payload(type + conn_id = 5) + crc(4) = 17 bytes
+        assert len(encoded) == 4 + 4 + 5 + 4
 
-        # Start both instances simultaneously
-        procs = []
-        for pty in ptys:
-            proc = subprocess.Popen(
-                [sys.executable, str(_SERIAL), "-d", pty, "-f", "none", "-t", "2"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+    def test_encode_control_roundtrip(self) -> None:
+        conn_id = b"\xaa\xbb\xcc\xdd"
+        for msg_type in [
+            MsgType.SYN,
+            MsgType.SYN_ACK,
+            MsgType.ACK,
+            MsgType.FIN,
+            MsgType.FIN_ACK,
+        ]:
+            encoded = encode_control(msg_type, conn_id)
+            port = MockSerialPort()
+            port.inject(encoded)
+            decoded_type, decoded_id, data, crc_ok = decode_message(port)
+            assert decoded_type == msg_type
+            assert decoded_id == conn_id
+            assert data == b""  # Control messages have no data
+            assert crc_ok is True
+
+    def test_encode_data_roundtrip(self) -> None:
+        conn_id = b"\x11\x22\x33\x44"
+        payload = b"Hello, world!"
+        encoded = encode_data(conn_id, payload)
+        port = MockSerialPort()
+        port.inject(encoded)
+        decoded_type, decoded_id, data, crc_ok = decode_message(port)
+        assert decoded_type == MsgType.DATA
+        assert decoded_id == conn_id
+        assert data == payload
+        assert crc_ok is True
+
+    def test_decode_invalid_short_message(self) -> None:
+        port = MockSerialPort()
+        # Inject incomplete data
+        port.inject(b"\x00\x00")
+        with pytest.raises(TransportError):
+            decode_message(port)
+
+
+@pytest.mark.unit
+class TestDrainInput:
+    """Tests for drain_input function."""
+
+    def test_drain_empty(self) -> None:
+        port = MockSerialPort()
+        drained = drain_input(port)
+        assert drained == 0
+
+    def test_drain_with_data(self) -> None:
+        port = MockSerialPort()
+        port.inject(b"stale data from previous run")
+        drained = drain_input(port)
+        assert drained == 28
+        assert port.in_waiting == 0
+
+
+@pytest.mark.unit
+class TestConnectionId:
+    """Tests for connection ID generation."""
+
+    def test_generate_connection_id_length(self) -> None:
+        conn_id = generate_connection_id()
+        assert len(conn_id) == 4
+
+    def test_generate_connection_id_unique(self) -> None:
+        ids = [generate_connection_id() for _ in range(100)]
+        assert len(set(ids)) == 100  # All unique
+
+
+@pytest.mark.unit
+class TestHandshakeHelpers:
+    """Tests for individual handshake helper functions."""
+
+    def test_server_wait_for_syn_timeout(self) -> None:
+        port = MockSerialPort()
+        with pytest.raises(PeeringError) as exc_info:
+            server_wait_for_syn(port, timeout_s=0.1)
+        assert "timeout" in str(exc_info.value).lower()
+
+    def test_server_wait_for_syn_success(self) -> None:
+        port = MockSerialPort()
+        expected_id = b"\x01\x02\x03\x04"
+        port.inject(encode_control(MsgType.SYN, expected_id))
+        conn_id = server_wait_for_syn(port, timeout_s=1.0)
+        assert conn_id == expected_id
+
+    def test_client_send_syn_wait_syn_ack_timeout(self) -> None:
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+        with pytest.raises(HandshakeError) as exc_info:
+            client_send_syn_wait_syn_ack(
+                port, conn_id, timeout_s=0.1, syn_interval_s=0.05
             )
-            procs.append(proc)
-            self.addCleanup(self._terminate_process, proc)
+        assert "timeout" in str(exc_info.value).lower()
 
-        # Verify both complete successfully
-        self._verify_successful_peering(procs)
-
-    @unittest.skipUnless(sys.platform == "linux", "Requires Linux")
-    def test_staggered_start_first_wins(self) -> None:
-        """First peer starts, second joins after delay - first should be initiator."""
-        socat, ptys = self._create_pty_pair()
-        self.addCleanup(self._terminate_process, socat)
-
-        # Start first peer
-        proc1 = subprocess.Popen(
-            [sys.executable, str(_SERIAL), "-d", ptys[0], "-f", "none", "-t", "3"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+    def test_client_send_syn_wait_syn_ack_success(self) -> None:
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+        # Inject SYN_ACK response
+        port.inject(encode_control(MsgType.SYN_ACK, conn_id))
+        result = client_send_syn_wait_syn_ack(
+            port, conn_id, timeout_s=1.0, syn_interval_s=0.1
         )
-        self.addCleanup(self._terminate_process, proc1)
+        assert result is True
 
-        # Wait a bit before starting second peer
-        time.sleep(0.5)
+    def test_server_send_syn_ack_wait_ack_timeout(self) -> None:
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+        with pytest.raises(PeeringError) as exc_info:
+            server_send_syn_ack_wait_ack(
+                port, conn_id, timeout_s=0.1, syn_ack_interval_s=0.05
+            )
+        assert "timeout" in str(exc_info.value).lower()
 
-        # Start second peer
-        proc2 = subprocess.Popen(
-            [sys.executable, str(_SERIAL), "-d", ptys[1], "-f", "none", "-t", "5"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+    def test_server_send_syn_ack_wait_ack_success(self) -> None:
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+        # Inject ACK response with session params (required)
+        port.inject(encode_ack_with_params(conn_id, SessionParams(msg_count=100)))
+        session_params = server_send_syn_ack_wait_ack(
+            port, conn_id, timeout_s=1.0, syn_ack_interval_s=0.1
         )
-        self.addCleanup(self._terminate_process, proc2)
+        assert session_params.msg_count == 100
 
-        # Verify both complete successfully
-        self._verify_successful_peering([proc1, proc2])
 
-        # First peer should be initiator (earlier timestamp)
-        stdout1, stderr1 = proc1.communicate(timeout=10)
-        output1 = stdout1 + stderr1
-        self.assertIn("initiator", output1.lower())
+@pytest.mark.unit
+class TestHandshake:
+    """Tests for full handshake protocol."""
 
-    @unittest.skipUnless(sys.platform == "linux", "Requires Linux")
-    def test_staggered_start_second_wins(self) -> None:
-        """Second peer starts after first - first should still be initiator."""
-        socat, ptys = self._create_pty_pair()
-        self.addCleanup(self._terminate_process, socat)
+    def test_client_handshake_timeout(self) -> None:
+        port = MockSerialPort()
+        # No SYN_ACK response - should raise PeeringError
+        with pytest.raises(PeeringError) as exc_info:
+            client_handshake(port, timeout_s=0.2, syn_interval_s=0.1)
+        assert "timeout" in str(exc_info.value).lower()
 
-        # Start first peer with longer duration
-        proc1 = subprocess.Popen(
-            [sys.executable, str(_SERIAL), "-d", ptys[0], "-f", "none", "-t", "5"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+    def test_server_handshake_timeout(self) -> None:
+        port = MockSerialPort()
+        # No SYN from client - should raise PeeringError
+        with pytest.raises(PeeringError) as exc_info:
+            server_handshake(port, client_timeout_s=0.2, ack_timeout_s=0.1)
+        assert "timeout" in str(exc_info.value).lower()
+
+    def test_handshake_message_sequence(self) -> None:
+        """Test that handshake messages can be decoded correctly."""
+        conn_id = b"\x01\x02\x03\x04"
+
+        # Test SYN encoding/decoding
+        syn = encode_control(MsgType.SYN, conn_id)
+        port = MockSerialPort()
+        port.inject(syn)
+        msg_type, recv_id, _, crc_ok = decode_message(port)
+        assert msg_type == MsgType.SYN
+        assert recv_id == conn_id
+        assert crc_ok
+
+        # Test SYN_ACK encoding/decoding
+        syn_ack = encode_control(MsgType.SYN_ACK, conn_id)
+        port = MockSerialPort()
+        port.inject(syn_ack)
+        msg_type, recv_id, _, crc_ok = decode_message(port)
+        assert msg_type == MsgType.SYN_ACK
+        assert recv_id == conn_id
+        assert crc_ok
+
+        # Test ACK encoding/decoding (with required session params)
+        ack = encode_ack_with_params(conn_id, SessionParams(msg_count=50))
+        port = MockSerialPort()
+        port.inject(ack)
+        msg_type, recv_id, data, crc_ok = decode_message(port)
+        assert msg_type == MsgType.ACK
+        assert recv_id == conn_id
+        assert crc_ok
+        # Verify session params can be decoded
+        full_payload = bytes([MsgType.ACK]) + recv_id + (data or b"")
+        _, session_params = decode_ack_with_params(full_payload)
+        assert session_params is not None
+        assert session_params.msg_count == 50
+
+
+@pytest.mark.unit
+class TestDataExchange:
+    """Tests for data send/receive functions."""
+
+    def test_send_data(self) -> None:
+        port = MockSerialPort()
+        conn = Connection(connection_id=b"\x01\x02\x03\x04", role=Role.CLIENT)
+        payload = b"test payload"
+        written = send_data(port, conn, payload)
+        assert written is not None
+        assert written > len(payload)  # Includes framing overhead
+
+    def test_recv_data_matching_id(self) -> None:
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+        conn = Connection(connection_id=conn_id, role=Role.SERVER)
+        payload = b"test data"
+
+        # Inject a DATA message
+        port.inject(encode_data(conn_id, payload))
+
+        data, crc_ok, msg_type = recv_data(port, conn)
+        assert data == payload
+        assert crc_ok is True
+        assert msg_type == MsgType.DATA
+
+    def test_recv_data_wrong_id_raises(self) -> None:
+        port = MockSerialPort()
+        conn = Connection(connection_id=b"\x01\x02\x03\x04", role=Role.SERVER)
+
+        # Inject a DATA message with different conn_id
+        port.inject(encode_data(b"\xff\xff\xff\xff", b"wrong id"))
+
+        with pytest.raises(ConnectionMismatchError):
+            recv_data(port, conn)
+
+    def test_recv_fin(self) -> None:
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+        conn = Connection(connection_id=conn_id, role=Role.SERVER)
+
+        # Inject a FIN message
+        port.inject(encode_control(MsgType.FIN, conn_id))
+
+        data, crc_ok, msg_type = recv_data(port, conn)
+        assert data == b""  # FIN has no data
+        assert msg_type == MsgType.FIN
+
+
+@pytest.mark.unit
+class TestShutdown:
+    """Tests for shutdown functions."""
+
+    def test_client_shutdown_timeout(self) -> None:
+        port = MockSerialPort()
+        conn = Connection(connection_id=b"\x01\x02\x03\x04", role=Role.CLIENT)
+        # Use short timeout for faster test
+        result = client_shutdown(port, conn, timeout_s=0.2)
+        assert result is False  # No FIN_ACK received
+
+    def test_server_shutdown(self) -> None:
+        port = MockSerialPort()
+        conn = Connection(connection_id=b"\x01\x02\x03\x04", role=Role.SERVER)
+        server_shutdown(port, conn)
+        # Should have written FIN_ACK
+        assert port.in_waiting > 0
+
+
+@pytest.mark.unit
+class TestSessionParams:
+    """Tests for ACK with session parameters encoding/decoding."""
+
+    def test_encode_ack_with_params_roundtrip(self) -> None:
+        """Test encoding and decoding ACK with session params."""
+        conn_id = b"\x01\x02\x03\x04"
+        session_params = SessionParams(msg_count=500)
+
+        encoded = encode_ack_with_params(conn_id, session_params)
+        port = MockSerialPort()
+        port.inject(encoded)
+
+        msg_type, recv_id, data, crc_ok = decode_message(port)
+        assert msg_type == MsgType.ACK
+        assert recv_id == conn_id
+        assert crc_ok
+
+        # Reconstruct full payload to decode session params
+        full_payload = bytes([MsgType.ACK]) + recv_id
+        if data:
+            full_payload += data
+
+        decoded_id, decoded_params = decode_ack_with_params(full_payload)
+        assert decoded_id == conn_id
+        assert decoded_params is not None
+        assert decoded_params.msg_count == 500
+
+    def test_decode_ack_missing_session_params(self) -> None:
+        """Test decoding ACK without session params raises EncodingError."""
+        conn_id = b"\xaa\xbb\xcc\xdd"
+        # ACK with only type + conn_id (no session params) is invalid
+        payload = bytes([MsgType.ACK]) + conn_id
+
+        with pytest.raises(EncodingError):
+            decode_ack_with_params(payload)
+
+    def test_decode_ack_with_params_too_short(self) -> None:
+        """Test decoding ACK with too-short payload raises EncodingError."""
+        # Payload shorter than type + conn_id + msg_count (9 bytes min)
+        payload = bytes([MsgType.ACK, 0x01, 0x02])
+
+        with pytest.raises(EncodingError):
+            decode_ack_with_params(payload)
+
+    def test_server_receives_session_params(self) -> None:
+        """Test server correctly extracts session params from ACK."""
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+        session_params = SessionParams(msg_count=250)
+
+        # Inject ACK with session params
+        port.inject(encode_ack_with_params(conn_id, session_params))
+
+        recv_params = server_send_syn_ack_wait_ack(
+            port, conn_id, timeout_s=1.0, syn_ack_interval_s=0.1
         )
-        self.addCleanup(self._terminate_process, proc1)
+        assert recv_params.msg_count == 250
 
-        # Wait a bit before starting second peer
-        time.sleep(1.0)
+    def test_server_rejects_ack_without_session_params(self) -> None:
+        """Test server rejects ACK without session params and times out."""
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
 
-        # Start second peer with shorter duration
-        proc2 = subprocess.Popen(
-            [sys.executable, str(_SERIAL), "-d", ptys[1], "-f", "none", "-t", "2"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        # Inject ACK without session params (using encode_control)
+        port.inject(encode_control(MsgType.ACK, conn_id))
+
+        with pytest.raises(PeeringError) as exc_info:
+            server_send_syn_ack_wait_ack(
+                port, conn_id, timeout_s=0.2, syn_ack_interval_s=0.1
+            )
+        # Should timeout because ACK without params is rejected
+        assert "timeout" in str(exc_info.value).lower()
+
+
+@pytest.mark.unit
+class TestCrcErrorHandling:
+    """Tests for CRC error handling in handshake and data exchange."""
+
+    def _corrupt_last_byte(self, data: bytes) -> bytes:
+        """Corrupt the last byte (part of CRC) of a message."""
+        return data[:-1] + bytes([data[-1] ^ 0xFF])
+
+    def test_server_ignores_syn_with_bad_crc(self) -> None:
+        """Server should ignore SYN with CRC error and timeout."""
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+
+        # Inject corrupted SYN
+        syn_msg = encode_control(MsgType.SYN, conn_id)
+        port.inject(self._corrupt_last_byte(syn_msg))
+
+        with pytest.raises(PeeringError) as exc_info:
+            server_wait_for_syn(port, timeout_s=0.2)
+        assert "timeout" in str(exc_info.value).lower()
+
+    def test_client_ignores_syn_ack_with_bad_crc(self) -> None:
+        """Client should ignore SYN_ACK with CRC error and timeout."""
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+
+        # Inject corrupted SYN_ACK
+        syn_ack_msg = encode_control(MsgType.SYN_ACK, conn_id)
+        port.inject(self._corrupt_last_byte(syn_ack_msg))
+
+        with pytest.raises(HandshakeError) as exc_info:
+            client_send_syn_wait_syn_ack(
+                port, conn_id, timeout_s=0.2, syn_interval_s=0.1
+            )
+        assert "timeout" in str(exc_info.value).lower()
+
+    def test_server_ignores_ack_with_bad_crc(self) -> None:
+        """Server should ignore ACK with CRC error and timeout."""
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+
+        # Inject corrupted ACK (with session params, then corrupt CRC)
+        ack_msg = encode_ack_with_params(conn_id, SessionParams(msg_count=100))
+        port.inject(self._corrupt_last_byte(ack_msg))
+
+        with pytest.raises(PeeringError) as exc_info:
+            server_send_syn_ack_wait_ack(
+                port, conn_id, timeout_s=0.2, syn_ack_interval_s=0.1
+            )
+        assert "timeout" in str(exc_info.value).lower()
+
+    def test_recv_data_reports_crc_error(self) -> None:
+        """recv_data should return crc_ok=False for corrupted DATA."""
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+        conn = Connection(connection_id=conn_id, role=Role.SERVER)
+
+        # Inject corrupted DATA message
+        data_msg = encode_data(conn_id, b"test payload")
+        port.inject(self._corrupt_last_byte(data_msg))
+
+        # decode_message returns payload with crc_ok=False
+        # but recv_data currently doesn't detect this because decode_message
+        # still returns the payload with crc_ok=False
+        data, crc_ok, msg_type = recv_data(port, conn)
+        # With corrupted CRC, the message may still be decoded but crc_ok=False
+        # or it may be completely mangled. Let's verify behavior.
+        if msg_type == MsgType.DATA:
+            assert crc_ok is False  # CRC error detected
+
+
+@pytest.mark.unit
+class TestWrongConnectionIdHandling:
+    """Tests for wrong connection ID filtering during handshake."""
+
+    def test_client_ignores_syn_ack_wrong_id(self) -> None:
+        """Client should ignore SYN_ACK with different connection ID."""
+        port = MockSerialPort()
+        our_conn_id = b"\x01\x02\x03\x04"
+        wrong_conn_id = b"\xff\xff\xff\xff"
+
+        # Inject SYN_ACK with wrong connection ID
+        port.inject(encode_control(MsgType.SYN_ACK, wrong_conn_id))
+
+        with pytest.raises(HandshakeError) as exc_info:
+            client_send_syn_wait_syn_ack(
+                port, our_conn_id, timeout_s=0.2, syn_interval_s=0.1
+            )
+        assert "timeout" in str(exc_info.value).lower()
+
+    def test_server_ignores_ack_wrong_id(self) -> None:
+        """Server should ignore ACK with different connection ID."""
+        port = MockSerialPort()
+        our_conn_id = b"\x01\x02\x03\x04"
+        wrong_conn_id = b"\xff\xff\xff\xff"
+
+        # Inject ACK with wrong connection ID (but valid session params)
+        port.inject(encode_ack_with_params(wrong_conn_id, SessionParams(msg_count=100)))
+
+        with pytest.raises(PeeringError) as exc_info:
+            server_send_syn_ack_wait_ack(
+                port, our_conn_id, timeout_s=0.2, syn_ack_interval_s=0.1
+            )
+        assert "timeout" in str(exc_info.value).lower()
+
+    def test_recv_data_raises_on_fin_wrong_id(self) -> None:
+        """recv_data should raise ConnectionMismatchError for FIN with wrong connection ID."""
+        port = MockSerialPort()
+        our_conn_id = b"\x01\x02\x03\x04"
+        wrong_conn_id = b"\xff\xff\xff\xff"
+        conn = Connection(connection_id=our_conn_id, role=Role.SERVER)
+
+        # Inject FIN with wrong connection ID
+        port.inject(encode_control(MsgType.FIN, wrong_conn_id))
+
+        with pytest.raises(ConnectionMismatchError):
+            recv_data(port, conn)
+
+
+@pytest.mark.unit
+class TestDuplicateMessageHandling:
+    """Tests for duplicate/retransmission message handling."""
+
+    def test_server_handles_duplicate_syn_then_valid(self) -> None:
+        """Server should handle duplicate SYN followed by valid ACK."""
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+
+        # Inject duplicate SYN (simulating retransmission), then valid ACK with params
+        port.inject(encode_control(MsgType.SYN, conn_id))
+        port.inject(encode_ack_with_params(conn_id, SessionParams(msg_count=100)))
+
+        # Should succeed - the duplicate SYN is handled, then ACK accepted
+        session_params = server_send_syn_ack_wait_ack(
+            port, conn_id, timeout_s=1.0, syn_ack_interval_s=0.1
         )
-        self.addCleanup(self._terminate_process, proc2)
+        assert session_params.msg_count == 100
 
-        # Both should complete - first peer's duration controls
-        for i, proc in enumerate([proc1, proc2]):
-            stdout, stderr = proc.communicate(timeout=15)
-            output = stdout + stderr
-            self.assertIn("Test completed successfully", output, f"Peer {i+1} failed")
 
-    @unittest.skipUnless(sys.platform == "linux", "Requires Linux")
-    def test_rapid_succession_starts(self) -> None:
-        """Start peers in rapid succession (< 100ms apart)."""
-        socat, ptys = self._create_pty_pair()
-        self.addCleanup(self._terminate_process, socat)
+@pytest.mark.unit
+class TestInvalidMessageType:
+    """Tests for invalid message type handling."""
 
-        procs = []
-        for pty in ptys:
-            proc = subprocess.Popen(
-                [sys.executable, str(_SERIAL), "-d", pty, "-f", "none", "-t", "2"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            procs.append(proc)
-            self.addCleanup(self._terminate_process, proc)
-            time.sleep(0.05)  # 50ms between starts
+    def test_decode_invalid_msg_type(self) -> None:
+        """decode_message should raise EncodingError for invalid message type."""
+        port = MockSerialPort()
+        # Create a message with invalid type (0xFF is not in MsgType enum)
+        invalid_payload = bytes([0xFF]) + b"\x01\x02\x03\x04"
+        encoded = message.encode(invalid_payload)
+        port.inject(encoded)
 
-        self._verify_successful_peering(procs)
+        with pytest.raises(EncodingError) as exc_info:
+            decode_message(port)
+        assert "Invalid message type" in str(exc_info.value)
 
-    @unittest.skipUnless(sys.platform == "linux", "Requires Linux")
-    def test_roles_are_complementary(self) -> None:
-        """Verify exactly one initiator and one responder."""
-        socat, ptys = self._create_pty_pair()
-        self.addCleanup(self._terminate_process, socat)
 
-        procs = []
-        for pty in ptys:
-            proc = subprocess.Popen(
-                [sys.executable, str(_SERIAL), "-d", pty, "-f", "none", "-t", "2"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            procs.append(proc)
-            self.addCleanup(self._terminate_process, proc)
+@pytest.mark.unit
+class TestEmptyPayloads:
+    """Tests for empty payload edge cases.
 
-        outputs = []
-        for proc in procs:
-            stdout, stderr = proc.communicate(timeout=10)
-            outputs.append(stdout + stderr)
+    Note: Empty data payloads (b"") result in data=b"" after decode because
+    the payload length equals type+conn_id with no additional bytes.
+    """
 
-        # Count initiators and responders
-        initiator_count = sum(1 for o in outputs if "initiator" in o.lower())
-        responder_count = sum(1 for o in outputs if "responder" in o.lower())
+    def test_encode_data_empty_payload(self) -> None:
+        """Test encoding DATA message with empty payload."""
+        conn_id = b"\x01\x02\x03\x04"
+        encoded = encode_data(conn_id, b"")
+        port = MockSerialPort()
+        port.inject(encoded)
 
-        self.assertEqual(initiator_count, 1, "Expected exactly one initiator")
-        self.assertEqual(responder_count, 1, "Expected exactly one responder")
+        msg_type, recv_id, data, crc_ok = decode_message(port)
+        assert msg_type == MsgType.DATA
+        assert recv_id == conn_id
+        # Empty payload results in data=b"" (no bytes beyond type+conn_id)
+        assert data == b""
+        assert crc_ok is True
 
-    @unittest.skipUnless(sys.platform == "linux", "Requires Linux")
-    def test_test_ids_match(self) -> None:
-        """Verify both peers agree on the same test_id."""
-        socat, ptys = self._create_pty_pair()
-        self.addCleanup(self._terminate_process, socat)
+    def test_recv_data_empty_payload(self) -> None:
+        """Test recv_data with empty DATA payload."""
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+        conn = Connection(connection_id=conn_id, role=Role.SERVER)
 
-        procs = []
-        for pty in ptys:
-            proc = subprocess.Popen(
-                [sys.executable, str(_SERIAL), "-d", pty, "-f", "none", "-t", "2"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            procs.append(proc)
-            self.addCleanup(self._terminate_process, proc)
+        port.inject(encode_data(conn_id, b""))
 
-        test_ids = []
-        for proc in procs:
-            stdout, stderr = proc.communicate(timeout=10)
-            output = stdout + stderr
-            # Extract test_id from output (format: test_id=XXXXXXXXXXXXXXXX)
-            match = re.search(r"test_id=([0-9a-f]{16})", output)
-            if match:
-                test_ids.append(match.group(1))
+        data, crc_ok, msg_type = recv_data(port, conn)
+        # Empty payload results in data=b""
+        assert data == b""
+        assert crc_ok is True
+        assert msg_type == MsgType.DATA
 
-        self.assertEqual(len(test_ids), 2, "Expected test_id from both peers")
-        self.assertEqual(test_ids[0], test_ids[1], "Test IDs should match")
+    def test_encode_data_single_byte_payload(self) -> None:
+        """Test encoding DATA message with single byte payload."""
+        conn_id = b"\x01\x02\x03\x04"
+        encoded = encode_data(conn_id, b"X")
+        port = MockSerialPort()
+        port.inject(encoded)
 
-    @unittest.skipUnless(sys.platform == "linux", "Requires Linux")
-    def test_short_duration(self) -> None:
-        """Test with minimum duration (2s)."""
-        socat, ptys = self._create_pty_pair()
-        self.addCleanup(self._terminate_process, socat)
+        msg_type, recv_id, data, crc_ok = decode_message(port)
+        assert msg_type == MsgType.DATA
+        assert recv_id == conn_id
+        assert data == b"X"  # Single byte is preserved
+        assert crc_ok is True
 
-        procs = []
-        for pty in ptys:
-            proc = subprocess.Popen(
-                [sys.executable, str(_SERIAL), "-d", pty, "-f", "none", "-t", "2"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            procs.append(proc)
-            self.addCleanup(self._terminate_process, proc)
 
-        self._verify_successful_peering(procs)
+@pytest.mark.unit
+class TestTruncatedMessages:
+    """Tests for truncated message handling."""
 
-    @unittest.skipUnless(sys.platform == "linux", "Requires Linux")
-    def test_longer_duration(self) -> None:
-        """Test with longer duration (10s)."""
-        socat, ptys = self._create_pty_pair()
-        self.addCleanup(self._terminate_process, socat)
+    def test_decode_truncated_crc(self) -> None:
+        """decode should raise TransportError for message with truncated CRC."""
+        port = MockSerialPort()
+        # Create a valid message then truncate it
+        valid_msg = encode_control(MsgType.SYN, b"\x01\x02\x03\x04")
+        # Truncate last 2 bytes of CRC
+        truncated = valid_msg[:-2]
+        port.inject(truncated)
 
-        procs = []
-        for pty in ptys:
-            proc = subprocess.Popen(
-                [sys.executable, str(_SERIAL), "-d", pty, "-f", "none", "-t", "10"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            procs.append(proc)
-            self.addCleanup(self._terminate_process, proc)
+        with pytest.raises(TransportError):
+            decode_message(port)
 
-        self._verify_successful_peering(procs, timeout=20)
+    def test_decode_only_length_field(self) -> None:
+        """decode should raise TransportError for message with only length field."""
+        port = MockSerialPort()
+        # Only 4-byte length claiming large payload, no actual data
+        port.inject(b"\x10\x00\x00\x00")  # Claims 16 bytes of payload
 
-    @unittest.skipUnless(sys.platform == "linux", "Requires Linux")
-    def test_mismatched_durations(self) -> None:
-        """Test with different durations - initiator's duration should be used."""
-        socat, ptys = self._create_pty_pair()
-        self.addCleanup(self._terminate_process, socat)
+        with pytest.raises(TransportError):
+            decode_message(port)
 
-        # Start with different durations
-        proc1 = subprocess.Popen(
-            [sys.executable, str(_SERIAL), "-d", ptys[0], "-f", "none", "-t", "3"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+
+@pytest.mark.unit
+class TestHandshakeWithValidThenInvalid:
+    """Tests for handshake receiving valid message after invalid ones."""
+
+    def test_client_receives_valid_after_corrupt(self) -> None:
+        """Client should accept valid SYN_ACK after ignoring corrupt one."""
+        port = MockSerialPort()
+        conn_id = b"\x01\x02\x03\x04"
+
+        # First inject a corrupted SYN_ACK
+        syn_ack_msg = encode_control(MsgType.SYN_ACK, conn_id)
+        port.inject(syn_ack_msg[:-1] + bytes([syn_ack_msg[-1] ^ 0xFF]))
+
+        # Then inject a valid SYN_ACK
+        port.inject(encode_control(MsgType.SYN_ACK, conn_id))
+
+        result = client_send_syn_wait_syn_ack(
+            port, conn_id, timeout_s=1.0, syn_interval_s=0.5
         )
-        self.addCleanup(self._terminate_process, proc1)
+        assert result is True
 
-        proc2 = subprocess.Popen(
-            [sys.executable, str(_SERIAL), "-d", ptys[1], "-f", "none", "-t", "10"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+    def test_server_receives_valid_after_wrong_id(self) -> None:
+        """Server should accept valid ACK after ignoring wrong ID."""
+        port = MockSerialPort()
+        our_conn_id = b"\x01\x02\x03\x04"
+        wrong_conn_id = b"\xff\xff\xff\xff"
+
+        # First inject ACK with wrong ID (but valid params)
+        port.inject(encode_ack_with_params(wrong_conn_id, SessionParams(msg_count=50)))
+
+        # Then inject valid ACK with correct ID
+        port.inject(encode_ack_with_params(our_conn_id, SessionParams(msg_count=200)))
+
+        session_params = server_send_syn_ack_wait_ack(
+            port, our_conn_id, timeout_s=1.0, syn_ack_interval_s=0.5
         )
-        self.addCleanup(self._terminate_process, proc2)
-
-        # Both should complete successfully
-        # (duration used depends on which peer becomes initiator)
-        for proc in [proc1, proc2]:
-            stdout, stderr = proc.communicate(timeout=15)
-            output = stdout + stderr
-            self.assertIn("Test completed successfully", output)
-
-    @unittest.skipUnless(sys.platform == "linux", "Requires Linux")
-    def test_staggered_start_bidirectional_data(self) -> None:
-        """Verify bidirectional data exchange with staggered start.
-
-        This tests the critical scenario where the responder enters the test
-        loop before the initiator finishes peering. Previously, the initiator
-        would flush its buffer on receiving PEER_ACK, discarding data the
-        responder had already sent.
-        """
-        socat, ptys = self._create_pty_pair()
-        self.addCleanup(self._terminate_process, socat)
-
-        # Start first peer with longer delay before second
-        proc1 = subprocess.Popen(
-            [sys.executable, str(_SERIAL), "-d", ptys[0], "-f", "none", "-t", "3"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self.addCleanup(self._terminate_process, proc1)
-
-        # Longer delay ensures responder starts sending before initiator
-        # finishes peering
-        time.sleep(1.5)
-
-        proc2 = subprocess.Popen(
-            [sys.executable, str(_SERIAL), "-d", ptys[1], "-f", "none", "-t", "3"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self.addCleanup(self._terminate_process, proc2)
-
-        # Both should complete and exchange data
-        for i, proc in enumerate([proc1, proc2]):
-            stdout, stderr = proc.communicate(timeout=10)
-            output = stdout + stderr
-
-            self.assertIn("Test completed successfully", output)
-
-            # Extract recv count - both sides must receive messages
-            match = re.search(r"recv=(\d+)", output)
-            self.assertIsNotNone(match, f"Peer {i+1} has no recv count")
-            assert match is not None
-            recv = int(match.group(1))
-            self.assertGreater(
-                recv, 0,
-                f"Peer {i+1} received no messages (bidirectional failure)"
-            )
-
-    def _create_pty_pair(self) -> tuple[subprocess.Popen, list[str]]:  # type: ignore[type-arg]
-        """Create a connected pty pair using socat."""
-        socat = subprocess.Popen(
-            ["socat", "-d", "-d", "pty,raw,echo=0", "pty,raw,echo=0"],
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        # Parse pty names from socat stderr output
-        ptys: list[str] = []
-        for _ in range(10):
-            assert socat.stderr is not None
-            line = socat.stderr.readline()
-            if "PTY is" in line:
-                match = re.search(r"/dev/pts/\d+", line)
-                if match:
-                    ptys.append(match.group())
-            if len(ptys) == 2:
-                break
-            time.sleep(0.1)
-
-        self.assertEqual(len(ptys), 2, f"Failed to get pty pair from socat: {ptys}")
-        return socat, ptys
-
-    def _verify_successful_peering(
-        self, procs: list[subprocess.Popen], timeout: int = 10  # type: ignore[type-arg]
-    ) -> None:
-        """Verify all processes complete successfully with proper peering."""
-        for i, proc in enumerate(procs):
-            stdout, stderr = proc.communicate(timeout=timeout)
-            output = stdout + stderr
-
-            # Check for success
-            self.assertIn(
-                "Test completed successfully",
-                output,
-                f"Peer {i+1} did not complete successfully:\n{output}",
-            )
-
-            # Check for proper role assignment
-            has_role = "initiator" in output.lower() or "responder" in output.lower()
-            self.assertTrue(
-                has_role, f"Peer {i+1} has no role assigned:\n{output}"
-            )
-
-            # Check for test_id
-            self.assertIn(
-                "test_id=", output, f"Peer {i+1} has no test_id:\n{output}"
-            )
-
-            # Check for stats
-            match = re.search(r"sent=(\d+) recv=(\d+) ok=(\d+)", output)
-            self.assertIsNotNone(
-                match, f"Peer {i+1} has no stats:\n{output}"
-            )
-            assert match is not None
-            recv = int(match.group(2))
-            ok = int(match.group(3))
-            self.assertGreater(recv, 0, f"Peer {i+1} received no messages")
-            self.assertEqual(ok, recv, f"Peer {i+1} has CRC failures")
-
-    @staticmethod
-    def _terminate_process(proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait()
-        if proc.stderr:
-            proc.stderr.close()
-        if proc.stdout:
-            proc.stdout.close()
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert session_params.msg_count == 200
