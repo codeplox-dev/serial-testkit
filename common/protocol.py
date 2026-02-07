@@ -10,7 +10,10 @@ Contains:
 import logging
 import os
 from enum import IntEnum
+
 from typing import Protocol
+
+from common.message import Reader
 
 # TRACE logging level (below DEBUG)
 TRACE = 5
@@ -31,7 +34,7 @@ class MsgType(IntEnum):
     FIN_ACK = 0x21
 
 
-class SerialPort(Protocol):
+class SerialPort(Reader, Protocol):
     """Protocol for serial port operations needed by peering."""
 
     def write(self, data: bytes, /) -> int | None: ...
