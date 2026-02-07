@@ -19,7 +19,7 @@ from typing import Protocol
 
 import serial
 
-import message
+from common import message
 
 logger = logging.getLogger(__name__)
 
